@@ -145,7 +145,8 @@ eatKnownInstructions(
 #pragma mark	-
 #pragma mark	(Interface)
 
-	mach_error_t
+
+mach_error_t
 mach_override(
 		char *originalFunctionSymbolName,
 		const char *originalFunctionLibraryNameHint,
@@ -176,7 +177,7 @@ mach_override(
 }
 
 #if defined(__x86_64__)
-mach_error_t makeIslandExecutable(void *address) {
+static mach_error_t makeIslandExecutable(void *address) {
 	mach_error_t err = err_none;
     vm_size_t pageSize;
     host_page_size( mach_host_self(), &pageSize );
@@ -203,6 +204,9 @@ mach_override_ptr(
 	long	*originalFunctionPtr = (long*) originalFunctionAddress;
 	mach_error_t	err = err_none;
 	
+    vm_size_t pageSize;
+    err = host_page_size( mach_host_self(), &pageSize );
+
 #if defined(__ppc__) || defined(__POWERPC__)
 	//	Ensure first instruction isn't 'mfctr'.
 	#define	kMFCTRMask			0xfc1fffff
@@ -235,6 +239,26 @@ mach_override_ptr(
 			err = vm_protect( mach_task_self(),
 					(vm_address_t) originalFunctionPtr, sizeof(long), false,
 					(VM_PROT_DEFAULT | VM_PROT_COPY) );
+        
+        if (!err)
+        {
+            // Make the next page writable if originalFunction
+            // is close to a page boundary
+            
+            uint64_t instructionStart = (uint64_t)originalFunctionPtr;
+            uint64_t instructionEnd = instructionStart + sizeof(jumpRelativeInstruction);
+            
+            if ((instructionEnd & (pageSize - 1)) < sizeof(jumpRelativeInstruction))
+            {
+                err = vm_protect( mach_task_self(),
+                                 (vm_address_t) instructionEnd,
+                                 sizeof(long), false, (VM_PROT_ALL | VM_PROT_COPY) );
+                if( err )
+                    err = vm_protect( mach_task_self(),
+                                     (vm_address_t) instructionEnd, sizeof(long), false,
+                                     (VM_PROT_DEFAULT | VM_PROT_COPY) );
+            }
+        }
 	}
 	if (err) printf("err = %x %d\n", err, __LINE__);
 	
@@ -268,7 +292,7 @@ mach_override_ptr(
 
 #if defined(__i386__) || defined(__x86_64__)
 	if (!err) {
-		uint32_t addressOffset = ((void*)escapeIsland - (void*)originalFunctionPtr - 5);
+		uint32_t addressOffset = (uint32_t)((void*)escapeIsland - (void*)originalFunctionPtr - 5);
 		addressOffset = OSSwapInt32(addressOffset);
 		
 		jumpRelativeInstruction |= 0xE900000000000000LL; 
@@ -562,10 +586,36 @@ static AsmInstructionMatch possibleInstructions[] = {
 	{ 0x1, {0xFF}, {0x55} },							// push %esp
 	{ 0x2, {0xFF, 0xFF}, {0x89, 0xE5} },				                // mov %esp,%ebp
 	{ 0x1, {0xFF}, {0x53} },							// push %ebx
-	{ 0x3, {0xFF, 0xFF, 0x00}, {0x83, 0xEC, 0x00} },	                        // sub 0x??, %esp
+	{ 0x3, {0xFF, 0xFF, 0x00}, {0x83, 0xEC, 0x00} },	// sub 0x??, %esp
+	{ 0x6, {0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00}, {0x81, 0xEC, 0x00, 0x00, 0x00, 0x00} }, // sub 0x??, %esp (immediate > 0x80)
+	{ 0x3, {0xFF, 0xFF, 0x00}, {0x89, 0x5D, 0x00} },	// mov %ebx, 0x??(%ebp)
+	{ 0x3, {0xFF, 0xFF, 0x00}, {0x89, 0x75, 0x00} },	// mov %esi, 0x??(%ebp)
+	{ 0x3, {0xFF, 0xFF, 0x00}, {0x8B, 0x45, 0x00} },	// mov 0x??(%ebp), %eax
+	{ 0x3, {0xFF, 0xFF, 0x00}, {0x8B, 0x5D, 0x00} },	// mov 0x??(%ebp), %ebx
+	{ 0x3, {0xFF, 0xFF, 0x00}, {0x8B, 0x55, 0x00} },	// mov 0x??(%ebp), %edx
+
+	{ 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x89, 0x5C, 0x24, 0x00} },	// mov %ebx, 0x??(%esp)
+	{ 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x89, 0x74, 0x24, 0x00} },	// mov %esi, 0x??(%esp)
+	{ 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x89, 0x7C, 0x24, 0x00} },	// mov %edi, 0x??(%esp)
+	{ 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x8B, 0x44, 0x24, 0x00} },	// mov 0x??(%esp), %eax
+	{ 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x8B, 0x54, 0x24, 0x00} },	// mov 0x??(%esp), %edx
+
+    { 0x3, {0xFF, 0xFF, 0x00}, {0x0F, 0x10, 0x00} },    // movups (%r??), %xmm?
+    { 0x3, {0xFF, 0xFF, 0x00}, {0x0F, 0x11, 0x00} },    // movups %xmm?, (%r??)
+
+    { 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x66, 0x0F, 0x10, 0x00} },    // movupd (%r??), %xmm?
+    { 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x66, 0x0F, 0x11, 0x00} },    // movupd %xmm?, (%r??)
+    
+    { 0x6, {0xFF, 0xF8, 0x00, 0x00, 0x00, 0x00}, {0x81, 0xF8, 0x00, 0x00, 0x00, 0x00} },    // cmpl 0x????????, %r??
+    
+    { 0x3, {0xFF, 0xC0}, {0x31, 0xC0} },                // xorl %r??, %r??
+    
+    { 0x5, {0xF8, 0x00, 0x00, 0x00, 0x00}, {0xB8, 0x00, 0x00, 0x00, 0x00} },    // mov 0x????????, %r??
+    
 	{ 0x1, {0xFF}, {0x57} },							// push %edi
 	{ 0x1, {0xFF}, {0x56} },							// push %esi
-	{ 0x0 }
+	
+    { 0x0, {0x00}, {0x00} }
 };
 #elif defined(__x86_64__)
 static AsmInstructionMatch possibleInstructions[] = {
@@ -574,9 +624,24 @@ static AsmInstructionMatch possibleInstructions[] = {
 	{ 0x3, {0xFF, 0xFF, 0xFF}, {0x48, 0x89, 0xE5} },				// mov %rsp,%rbp
 	{ 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x48, 0x83, 0xEC, 0x00} },	                // sub 0x??, %rsp
 	{ 0x4, {0xFB, 0xFF, 0x00, 0x00}, {0x48, 0x89, 0x00, 0x00} },	                // move onto rbp
+	{ 0x7, {0xFF, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x00}, {0x48, 0x8B, 0x80, 0x00, 0x00, 0x00, 0x00} },	// mov 0x????????(%r??), %r??
 	{ 0x2, {0xFF, 0x00}, {0x41, 0x00} },						// push %rXX
 	{ 0x2, {0xFF, 0x00}, {0x85, 0x00} },						// test %rX,%rX
-	{ 0x0 }
+
+	{ 0x9, {0xFF, 0xFF, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, {0x66, 0x81, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} },	// cmpw $????, 0x????????(%rdi)
+	{ 0x8, {0xFF, 0xFF, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00}, {0x66, 0x83, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00} },	// cmpw $??, 0x????????(%rdi)
+
+    { 0x3, {0xFF, 0xFF, 0x00}, {0x0F, 0x10, 0x00} },    // movups (%r??), %xmm?
+    { 0x3, {0xFF, 0xFF, 0x00}, {0x0F, 0x11, 0x00} },    // movups %xmm?, (%r??)
+
+    { 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x66, 0x0F, 0x10, 0x00} },    // movupd (%r??), %xmm?
+    { 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x66, 0x0F, 0x11, 0x00} },    // movupd %xmm?, (%r??)
+    
+    { 0x6, {0xFF, 0xF8, 0x00, 0x00, 0x00, 0x00}, {0x81, 0xF8, 0x00, 0x00, 0x00, 0x00} },    // cmpl 0x????????, %r??
+
+	{ 0x4, {0xFF, 0xFF, 0xFF, 0x00}, {0x66, 0x0F, 0x28, 0x00} },			// movapd %xmm?, %xmm?
+
+	{ 0x0, {0x00}, {0x00} }
 };
 #endif
 
@@ -584,7 +649,7 @@ static Boolean codeMatchesInstruction(unsigned char *code, AsmInstructionMatch* 
 {
 	Boolean match = true;
 	
-	int i;
+	unsigned int i;
 	for (i=0; i<instruction->length; i++) {
 		unsigned char mask = instruction->mask[i];
 		unsigned char constraint = instruction->constraint[i];
@@ -617,12 +682,13 @@ eatKnownInstructions(
 		// See if instruction matches one  we know
 		AsmInstructionMatch* curInstr = possibleInstructions;
 		do { 
-			if (curInstructionKnown = codeMatchesInstruction(ptr, curInstr)) break;
+			if ((curInstructionKnown = codeMatchesInstruction(ptr, curInstr))) break;
 			curInstr++;
 		} while (curInstr->length > 0);
 		
 		// if all instruction matches failed, we don't know current instruction then, stop here
 		if (!curInstructionKnown) { 
+			printf("Instruction not eaten %02x %02x %02x %02x %02x\n", ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]);
 			allInstructionsKnown = false;
 			break;
 		}
@@ -665,7 +731,7 @@ eatKnownInstructions(
 #endif
 
 #if defined(__i386__)
-asm(		
+__asm__(		
 			".text;"
 			".align 2, 0x90;"
 			".globl _atomic_mov64;"
